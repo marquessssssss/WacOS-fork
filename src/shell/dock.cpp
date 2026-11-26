@@ -816,7 +816,8 @@ void PaintBack() {
     float rad = DOCK_RADIUS;
     bool dark = ui::Dark();
     if (g_glass) {  // vidro da Composição: recorte com a mesma curva do Dock
-        SetWindowPos(g_back, g_icons, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        bool estavaOculto = !IsWindowVisible(g_back);
+        SetWindowPos(g_back, g_icons, x, y, w, h, SWP_NOACTIVATE | (estavaOculto ? 0 : SWP_SHOWWINDOW));
         D2D1_COLOR_F tint = dark ? D2D1::ColorF(0.13f, 0.14f, 0.15f, 0.50f) : D2D1::ColorF(0.98f, 0.98f, 0.99f, 0.38f);
         // Tahoe: cor do vidro medida na tela (guia macOS26-Theme-Reference, seções 52 e 60): saída ≈ 0,61 × fundo + 0,11
         // no escuro (39 % de um cinza 0,28 por cima do fundo desfocado); no claro a média sobe ~0,11 (cinza 0,56)
@@ -828,6 +829,7 @@ void PaintBack() {
         else if (g_vidroCor == 3) { D2D1_COLOR_F ac = ui::Accent(); tint = D2D1::ColorF(ac.r, ac.g, ac.b, tint.a); }
         if (g_vidroOpac >= 0) tint.a = g_vidroOpac;
         backdrop::Set(g_back, (float)w, (float)h, rad * sc, tint);
+        if (estavaOculto) SetWindowPos(g_back, g_icons, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         return;
     }
     // Sem a Composição: acrílico com o canto de 8 do DWM, encolhido para caber dentro da curva.

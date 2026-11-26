@@ -485,6 +485,7 @@ std::atomic<bool> capDirty{ false };  // chegou quadro novo ou janela mexeu: mon
 std::atomic<bool> allDirty{ true };
 bool g_fingeMesaPreta = false;  // teste: mensagem ShellVidroMesaPreta (w = 1 liga, 0 desliga; só na memória)
 std::atomic<bool> frameDirty{ false };  // só chegou quadro novo (conteúdo): monta no máximo a cada 15 ms (30 por segundo ficava lento de ver)
+std::atomic<bool> refreshDirty{ false };  // janela mudou ou captura nova ficou pronta: reler a lista mesmo se adiado para T_RG + 1
 double lastFrameCompose = 0;
 std::vector<RECT> lastDirty;  // áreas montadas na última vez (as peças nelas são redesenhadas)
 // Montando o fundo agora. Os objetos da captura vivem em outra thread (MTA): usá-los daqui faz o COM
@@ -496,7 +497,7 @@ ID2D1Bitmap* noise;
 std::map<std::wstring, ID2D1Bitmap*> maps;  // mapas de lente por tamanho/raio/força
 
 void Redraw(Entry& e);
-void Poll(bool refresh = true);  // refresh: relê a lista de janelas (só quando algo abriu/fechou/mexeu)
+void Poll(bool refresh = true, HWND extra = nullptr);  // refresh: relê a lista de janelas; extra: peça prestes a aparecer (ainda oculta)
 // Áreas das peças de vidro (coordenadas da tela principal), copiadas para a thread da captura: um quadro novo
 // cuja parte alterada (Windows 11 24H2: regiões sujas) não passa atrás de nenhuma peça não remonta nada.
 // Ex.: o app do Claude/Discord animando no meio da janela fazia o vidro remontar ~50 vezes/s à toa.
@@ -545,11 +546,12 @@ LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         posted = false;
         // janela mexendo: até 60 por segundo; só conteúdo mudando (vídeo, texto rolando atrás do Dock): também até 60 (30 deixava o vidro atrasado)
         // (frameDirty, ver Poll)
-        if (w == 1) frameDirty = true; else capDirty = true;
+        if (w == 1) frameDirty = true;
+        else { capDirty = true; refreshDirty = true; }
         static double last = 0;
-        bool soPapel = w == 1 && !capDirty && !st_nonDesk.load();  // só o papel de parede animado: 30 por segundo
+        bool soPapel = w == 1 && !capDirty && !refreshDirty && !st_nonDesk.load();  // só o papel de parede animado: 30 por segundo
         double gap = soPapel ? 33.0 : 15.5;
-        if (anim::Now() - last >= gap) { last = anim::Now(); st_nonDesk = false; Poll(w != 1); }
+        if (anim::Now() - last >= gap) { last = anim::Now(); st_nonDesk = false; Poll(false); }
         else SetTimer(h, T_RG + 1, soPapel ? 33 : 16, nullptr);  // cedo demais: monta no próximo tique (uma vez só)
         return 0;
     }
@@ -558,7 +560,7 @@ LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         KillTimer(h, T_RG + 1);
         st_nonDesk = false;
         Poll(false);
-        if (frameDirty || capDirty) SetTimer(h, T_RG + 1, 16, nullptr);
+        if (frameDirty || capDirty || refreshDirty) SetTimer(h, T_RG + 1, 16, nullptr);
         return 0;
     }
     if (m == WM_TIMER && w == T_RG && g_busy) return 0;
@@ -761,11 +763,11 @@ std::vector<std::pair<HWND, std::shared_ptr<WinCap>>> ready;  // abertas pela th
 std::vector<HWND> pending;
 
 winrt::com_ptr<ID2D1Bitmap1> g_papel;  // o papel de parede da mesa, por baixo do fundo (issue #31; Compose)
-std::vector<RECT> GlassAreas();
+std::vector<RECT> GlassAreas(HWND extra = nullptr);
 bool capJaFuncionou = false;  // alguma montagem já teve janela com quadro (a captura funciona neste PC)
 bool appRecusada = false;     // a captura de uma janela de app (não a mesa nem a barra do Windows) foi recusada
 
-void RefreshWindows() {
+void RefreshWindows(HWND extra = nullptr) {
     {   // sem captura nenhuma (todas recusadas, nenhuma aberta) por 3 s: também desiste
         // Com o papel de parede por baixo (g_papel) o fundo não fica preto: logo ao iniciar, sem app aberto, as únicas
         // janelas são a mesa e a barra do Windows (recusadas sempre), e o vidro desistia até reiniciar num PC em que a
@@ -792,15 +794,17 @@ void RefreshWindows() {
     }
     std::vector<HWND> want;
     bool anyGlass = false;
-    for (auto& [hh, e] : g_entries) if (e.real && IsWindowVisible(e.hwnd)) { anyGlass = true; break; }
-    if (anyGlass) {
+    for (auto& [hh, e] : g_entries) if (e.real && (hh == extra || IsWindowVisible(e.hwnd))) { anyGlass = true; break; }
+    {
         // Cada captura segura 2 quadros do tamanho da janela na memória de vídeo (numa tela 3440x1440, ~40 MB por janela
-        // maximizada; com 10 janelas, ~400 MB, que no vídeo integrado saem da RAM). As 6 de cima ficam sempre (o Alt+Tab traz
-        // uma delas e o vidro já tem o quadro); das outras, só as que aparecem atrás de alguma peça de vidro (não estão
-        // cobertas ali pelas janelas opacas de cima).
-        auto areas = GlassAreas();
-        struct Ctx { std::vector<HWND>* out; DWORD me; HRGN covered; HRGN tmp; HRGN screen; bool afterMesa; const std::vector<RECT>* areas; } cx{ &want, GetCurrentProcessId(),
-            CreateRectRgn(0, 0, 0, 0), CreateRectRgn(0, 0, 0, 0), CreateRectRgnIndirect(&mon), false, &areas };
+        // maximizada; com 10 janelas, ~400 MB, que no vídeo integrado saem da RAM). Com vidro visível, as 6 de cima ficam
+        // sempre (o Alt+Tab traz uma delas e o vidro já tem o quadro) e, das outras, só as que aparecem atrás de alguma
+        // peça. Sem vidro visível agora (ex.: Dock oculto automaticamente e barra sem vidro), mantemos aquecidas só as
+        // janelas visíveis no topo que cobrem o monitor (até 3; janela maximizada = só 1 captura, a 4/s e sem Compose):
+        // ao abrir um menu ou chamar o Dock, o fundo do app já está pronto no primeiro quadro (sem piscar o papel de parede).
+        auto areas = anyGlass ? GlassAreas(extra) : std::vector<RECT>{};
+        struct Ctx { std::vector<HWND>* out; DWORD me; HRGN covered; HRGN tmp; HRGN screen; bool afterMesa; bool anyGlass; const std::vector<RECT>* areas; } cx{ &want, GetCurrentProcessId(),
+            CreateRectRgn(0, 0, 0, 0), CreateRectRgn(0, 0, 0, 0), CreateRectRgnIndirect(&mon), false, anyGlass, &areas };
         EnumWindows([](HWND h, LPARAM lp) -> BOOL {
             auto* cx = (Ctx*)lp;
             if (!IsWindowVisible(h) || IsIconic(h) || Cloaked(h)) return TRUE;
@@ -819,14 +823,20 @@ void RefreshWindows() {
                 if (wcscmp(c, L"SequoiaMesa")) return TRUE;
                 mesa = true;
             }
-            if (cx->out->size() >= 10 && !mesa) return TRUE;  // cheio: só falta a mesa, que fica sempre (embaixo de tudo)
+            if (!cx->anyGlass) {
+                if (CombineRgn(cx->tmp, cx->screen, cx->covered, RGN_DIFF) == NULLREGION) return FALSE;  // tela já coberta
+                if (cx->out->size() >= 3 && !mesa) return TRUE;
+            } else if (cx->out->size() >= 10 && !mesa) return TRUE;  // cheio: só falta a mesa, que fica sempre (embaixo de tudo)
             // camadas transparentes por cima de tudo (sombras de janelas, o overlay da NVIDIA): não são conteúdo
             // e a captura devolve elas pretas, o que escurecia o vidro inteiro
             LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
             if ((ex & WS_EX_TRANSPARENT) || ((ex & WS_EX_LAYERED) && (ex & WS_EX_NOACTIVATE))) return TRUE;
             RECT r = Bounds(h), x;
             if (r.right - r.left < 2 || r.bottom - r.top < 2 || !IntersectRect(&x, &r, &mon)) return TRUE;
-            if (!mesa && cx->out->size() >= 6) {  // além das 6 de cima: só se alguma parte dela aparece atrás de uma peça
+            if (!cx->anyGlass && !mesa) {  // sem vidro visível: só se alguma parte dela aparece fora das janelas de cima
+                SetRectRgn(cx->tmp, x.left, x.top, x.right, x.bottom);
+                if (CombineRgn(cx->tmp, cx->tmp, cx->covered, RGN_DIFF) == NULLREGION) return TRUE;
+            } else if (!mesa && cx->out->size() >= 6) {  // além das 6 de cima: só se alguma parte dela aparece atrás de uma peça
                 RECT b = r; OffsetRect(&b, -mon.left, -mon.top);
                 bool aparece = false;
                 for (auto& a : *cx->areas) {
@@ -875,11 +885,14 @@ void RefreshWindows() {
     if (changed) { capDirty = true; allDirty = true; }
     if (capFailed.size() > 256) capFailed.clear();
     if (!toStart.empty()) {
+        // want está de baixo para cima (para desenhar); abre as capturas de cima para baixo para o app da frente chegar antes da mesa
+        std::reverse(toStart.begin(), toStart.end());
         std::thread([toStart] {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             for (HWND h : toStart) {
                 auto c = StartCap(h);
                 { std::lock_guard<std::mutex> lk(readyMx); ready.emplace_back(h, c); }
+                capDirty = true; refreshDirty = true;
                 if (!posted.exchange(true)) PostMessageW(msgWnd, WM_RG_FRAME, 0, 0);
             }
             winrt::uninit_apartment();
@@ -931,11 +944,12 @@ LONG MarginFor(const Entry& e, const RECT& r) {
     const float sigma = std::max(0.6f + 11.f * g_style.tintK, e.pieceFrost) * px;
     return std::clamp((LONG)std::ceil(3 * sigma + dmax + 4), (LONG)8, COMPOSE_MARGIN);
 }
-std::vector<RECT> GlassAreas() {
+std::vector<RECT> GlassAreas(HWND extra) {
     std::vector<RECT> v;
     RECT all{ 0, 0, (LONG)texW, (LONG)texH };
     for (auto& [hh, e] : g_entries) {
-        if (!e.real || !IsWindowVisible(e.hwnd) || CoveredByFullscreen(e.hwnd)) continue;
+        if (!e.real) continue;
+        if (hh != extra && (!IsWindowVisible(e.hwnd) || CoveredByFullscreen(e.hwnd))) continue;
         RECT r; GetWindowRect(e.hwnd, &r);
         OffsetRect(&r, -mon.left, -mon.top);
         const LONG mg = MarginFor(e, r);
@@ -951,10 +965,12 @@ bool Inside(const RECT& r, const std::vector<RECT>& areas) {
     for (auto& a : areas) { RECT x; if (IntersectRect(&x, &r, &a) && EqualRect(&x, &r)) return true; }
     return false;
 }
-// A peça está numa parte do fundo que já foi montada? (senão, monta de novo antes de desenhar)
-bool Composed(HWND h) {
-    RECT r; GetWindowRect(h, &r);
+// A peça (com a margem do desfoque e da lente) está numa parte do fundo que já foi montada? (senão, monta de novo antes de desenhar)
+bool Composed(const Entry& e) {
+    RECT r; GetWindowRect(e.hwnd, &r);
     OffsetRect(&r, -mon.left, -mon.top);
+    const LONG mg = MarginFor(e, r);
+    InflateRect(&r, mg, mg);
     RECT all{ 0, 0, (LONG)texW, (LONG)texH };
     IntersectRect(&r, &r, &all);
     return IsRectEmpty(&r) || Inside(r, composed);
@@ -1006,9 +1022,9 @@ bool QuadroPreto(ID3D11Texture2D* t, UINT w, UINT h) {
 }
 
 // Monta o fundo em tex: o papel de parede, a mesa e as janelas na ordem (só na área das peças).
-void Compose() {
+void Compose(HWND extra = nullptr) {
     if (!target) return;
-    std::vector<RECT> areas = GlassAreas();
+    std::vector<RECT> areas = GlassAreas(extra);
     composed = areas;
     { std::lock_guard<std::mutex> lk(areasMx); areasSnap = areas; }
     for (auto& c : caps) {  // quem está atrás de alguma peça: só o quadro novo dessas monta o fundo de novo
@@ -1121,6 +1137,7 @@ void Compose() {
 void CALLBACK OnWinChange(HWINEVENTHOOK, DWORD ev, HWND h, LONG obj, LONG child, DWORD, DWORD) {
     if (!active || !h) return;
     if (ev != EVENT_SYSTEM_FOREGROUND && (obj != OBJID_WINDOW || child != CHILDID_SELF || GetAncestor(h, GA_ROOT) != h)) return;
+    capDirty = true; refreshDirty = true;
     if (!posted.exchange(true)) PostMessageW(msgWnd, WM_RG_FRAME, 0, 0);
 }
 
@@ -1172,18 +1189,18 @@ void Dump() {
     Log(L"vidro real: diagnóstico gravado (%d janelas)", i);
 }
 
-void Poll(bool refresh) {
+void Poll(bool refresh, HWND extra) {
     static HWINEVENTHOOK fg = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnWinChange, 0, 0, WINEVENT_OUTOFCONTEXT);
     static HWINEVENTHOOK ch = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_REORDER, nullptr, OnWinChange, 0, 0, WINEVENT_OUTOFCONTEXT | shell::SemProprio());
     static bool mv = (jogo::GanchoPosicao(OnWinChange, WINEVENT_OUTOFCONTEXT | shell::SemProprio()), true);  // sai no modo jogo (jogo.cpp)
     (void)fg; (void)ch; (void)mv;
-    if (g_busy) { capDirty = true; return; }  // chamada de dentro dela mesma: o temporizador pega depois
+    if (g_busy) { capDirty = true; if (refresh) refreshDirty = true; return; }  // chamada de dentro dela mesma: o temporizador pega depois
     g_busy = true;
     struct Done { ~Done() { g_busy = false; } } done;
     double t0 = anim::Now();
-    if (refresh) RefreshWindows();
+    if (refresh || refreshDirty.exchange(false)) RefreshWindows(extra);
     {  // uma peça apareceu ou cresceu para fora da área montada
-        for (auto& a : GlassAreas()) if (!Inside(a, composed)) { capDirty = true; allDirty = true; break; }
+        for (auto& a : GlassAreas(extra)) if (!Inside(a, composed)) { capDirty = true; allDirty = true; break; }
     }
     bool go = capDirty.exchange(false);
     if (!go && frameDirty && anim::Now() - lastFrameCompose >= 15) go = true;
@@ -1191,11 +1208,13 @@ void Poll(bool refresh) {
     frameDirty = false;
     lastFrameCompose = anim::Now();
     st_composes++;
-    Compose();
+    Compose(extra);
     for (auto& [hh, e] : g_entries) {
         if (!e.real || !IsWindowVisible(e.hwnd)) continue;
         RECT r; GetWindowRect(e.hwnd, &r);
         OffsetRect(&r, -mon.left, -mon.top);
+        const LONG mg = MarginFor(e, r);
+        InflateRect(&r, mg, mg);
         bool d = false;
         for (auto& a : lastDirty) { RECT x; if (IntersectRect(&x, &r, &a)) { d = true; break; } }
         if (d) Redraw(e);  // o fundo atrás desta peça mudou
@@ -1509,8 +1528,21 @@ void Redraw(Entry& e) {
     st_redraws++;
     if (!active || !screen || !e.surf) return;
     if (CoveredByFullscreen(e.hwnd)) return;  // atrás do app em tela cheia: ninguém vê; redesenha quando ele sair
-    // peça nova ou que se mexeu para fora da área montada: monta o fundo de novo (a montagem redesenha todas)
-    if (!g_busy && IsWindowVisible(e.hwnd) && !Composed(e.hwnd)) { capDirty = true; allDirty = true; Poll(); return; }
+    // peça nova (mesmo ainda oculta, antes do ShowWindow: menus, seletor, Dock) ou que se mexeu para fora da área
+    // montada: monta o fundo já antes de desenhar, sem esperar o temporizador de 250 ms
+    bool visible = IsWindowVisible(e.hwnd);
+    bool needCompose = !Composed(e);
+    if (!needCompose && !visible) {
+        RECT r; GetWindowRect(e.hwnd, &r);
+        OffsetRect(&r, -mon.left, -mon.top);
+        RECT all{ 0, 0, (LONG)texW, (LONG)texH }, x;
+        needCompose = IntersectRect(&x, &r, &all) != 0;
+    }
+    if (!g_busy && needCompose) {
+        capDirty = true; allDirty = true;
+        Poll(true, e.hwnd);
+        if (visible) return;
+    }
     RECT r; GetWindowRect(e.hwnd, &r);
     e.lastRect = r;
     float px = GetDpiForWindow(e.hwnd) / 96.f;

@@ -203,9 +203,9 @@ void Show() {
     int x = (g_mon.left + g_mon.right - wpx) / 2, y = (g_mon.top + g_mon.bottom - hpx) / 2;
     // desenha antes de aparecer: o primeiro quadro já vem com os ícones
     SetWindowPos(g_wnd, HWND_TOPMOST, x, y, wpx, hpx, SWP_NOACTIVATE);
+    SetWindowPos(g_back, HWND_TOPMOST, x, y, wpx, hpx, SWP_NOACTIVATE);
     g_visible = true;
     Paint();
-    SetWindowPos(g_back, HWND_TOPMOST, x, y, wpx, hpx, SWP_NOACTIVATE);
     // Mostra só depois que o vidro redesenhado chegou à tela: a janela do vidro guarda o que tinha da última
     // vez, e aparecendo junto com o desenho novo ela mostrava a janela antiga por um quadro ou dois.
     if (g_glass) { backdrop::AfterCommit(g_wnd, WM_SHOWNOW); SetTimer(g_wnd, T_SHOWNOW, 50, nullptr); }
